@@ -1,0 +1,157 @@
+name: Upstream Binaries
+
+# Polls the canonical upstream repo (dcramer/dex) for new version tags and, when
+# it finds one this fork hasn't built yet, compiles standalone binaries with Bun
+# and publishes them as a GitHub Release on THIS fork. Node is not required to run
+# the resulting binaries.
+#
+# Trigger is poll-based (cron), not event-based: upstream tags do not emit events
+# into a fork, and installing a webhook/repository_dispatch would need push access
+# to dcramer/dex, which we don't have.
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub may delay scheduled runs under load; tighten or
+    # loosen to taste. Latency to a new binary == at most one poll interval.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (defaults to latest). e.g. v0.16.0"
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if a release already exists"
+        required: false
+        type: boolean
+        default: false
+
+# Never let two runs race on the same release.
+concurrency:
+  group: upstream-binaries
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: dcramer/dex
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.decide.outputs.tag }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - name: Determine target tag and whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_TAG}" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            # Highest semver tag matching v*. ls-remote is reliable regardless of
+            # how the REST /tags endpoint happens to order results.
+            TAG="$(git ls-remote --tags --refs "https://github.com/${UPSTREAM}.git" 'v*' \
+              | awk '{print $2}' | sed 's#refs/tags/##' | sort -V | tail -1)"
+          fi
+
+          if [ -z "${TAG}" ]; then
+            echo "No upstream tags found." >&2
+            exit 1
+          fi
+          echo "Latest upstream tag: ${TAG}"
+
+          SHOULD_BUILD=true
+          if [ "${FORCE}" != "true" ]; then
+            if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              echo "Release ${TAG} already exists on ${GITHUB_REPOSITORY}; nothing to do."
+              SHOULD_BUILD=false
+            fi
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-linux-x64
+            asset: dex-linux-x64
+          - target: bun-linux-arm64
+            asset: dex-linux-arm64
+          - target: bun-darwin-x64
+            asset: dex-darwin-x64
+          - target: bun-darwin-arm64
+            asset: dex-darwin-arm64
+          - target: bun-windows-x64
+            asset: dex-windows-x64.exe
+    steps:
+      - name: Checkout upstream at tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.tag }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Compile standalone binary
+        # Bun cross-compiles every target from a single Linux runner.
+        run: |
+          set -euo pipefail
+          bun build ./src/index.ts \
+            --compile \
+            --target=${{ matrix.target }} \
+            --outfile "${{ matrix.asset }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create / update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ls -la artifacts
+
+          # Create the release if absent, then (re)upload the assets. --clobber
+          # makes force-rebuilds idempotent.
+          if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${TAG}" \
+              --notes "Standalone binaries built from upstream ${UPSTREAM}@${TAG} with Bun. No Node install required. Original source is MIT-licensed by its authors."
+          fi
+
+          gh release upload "${TAG}" artifacts/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
