@@ -107,6 +107,20 @@ jobs:
       - name: Install dependencies
         run: bun install
 
+      - name: Inline version for standalone build
+        # Upstream's src/cli/version.ts reads package.json at runtime via
+        # createRequire. That file does not exist inside a Bun-compiled binary,
+        # so the require throws on EVERY command. Replace it with the tag literal
+        # before compiling. (Fix belongs upstream too; this keeps the fork usable.)
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          printf 'export function versionCommand(): void {\n  console.log("dex v%s");\n}\n' "${VERSION}" > src/cli/version.ts
+          echo "Patched src/cli/version.ts:"
+          cat src/cli/version.ts
+
       - name: Compile standalone binary
         # Bun cross-compiles every target from a single Linux runner.
         run: |
@@ -143,15 +157,52 @@ jobs:
           set -euo pipefail
           ls -la artifacts
 
+          REPO="${GITHUB_REPOSITORY}"
+          REPO_OWNER="${GITHUB_REPOSITORY%%/*}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+
+          NOTES="$(cat <<EOF
+          Standalone binaries built from upstream \`${UPSTREAM}@${TAG}\` with Bun. No Node install required. Original source is MIT-licensed by its authors.
+
+          ## Install
+
+          ### Homebrew (macOS / Linux)
+
+          \`\`\`bash
+          brew install ${REPO_OWNER}/dex/dex
+          \`\`\`
+
+          ### Manual — macOS (Apple Silicon)
+
+          \`\`\`bash
+          curl -Lo dex ${BASE}/dex-darwin-arm64
+          chmod +x dex
+          xattr -d com.apple.quarantine dex   # unsigned binary; clears Gatekeeper
+          sudo mv dex /usr/local/bin/
+          \`\`\`
+
+          For an Intel Mac, use \`dex-darwin-x64\`.
+
+          ### Manual — Linux
+
+          \`\`\`bash
+          curl -Lo dex ${BASE}/dex-linux-x64   # or dex-linux-arm64
+          chmod +x dex
+          sudo mv dex /usr/local/bin/
+          \`\`\`
+
+          ### Manual — Windows
+
+          Download \`dex-windows-x64.exe\`, rename to \`dex.exe\`, and place it on your \`PATH\`.
+          EOF
+          )"
+
           # Create the release if absent, then (re)upload the assets. --clobber
           # makes force-rebuilds idempotent.
-          if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release create "${TAG}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "${TAG}" \
-              --notes "Standalone binaries built from upstream ${UPSTREAM}@${TAG} with Bun. No Node install required. Original source is MIT-licensed by its authors."
+          if ! gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1; then
+            gh release create "${TAG}" --repo "${REPO}" --title "${TAG}" --notes "${NOTES}"
+          else
+            gh release edit "${TAG}" --repo "${REPO}" --notes "${NOTES}"
           fi
 
-          gh release upload "${TAG}" artifacts/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --clobber
+          gh release upload "${TAG}" artifacts/* --repo "${REPO}" --clobber
