@@ -206,3 +206,92 @@ jobs:
           fi
 
           gh release upload "${TAG}" artifacts/* --repo "${REPO}" --clobber
+
+  update-tap:
+    needs: [check, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Regenerate Homebrew formula
+        # Rewrites Formula/dex.rb in the tap repo to point at this release and
+        # its checksums, then pushes. Cross-repo push needs a PAT (GITHUB_TOKEN
+        # is scoped to this repo only) — create a fine-grained token with
+        # Contents:write on <owner>/homebrew-dex and store it as the repo secret
+        # HOMEBREW_TAP_TOKEN. Absent that secret, this step no-ops.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set; skipping formula update."
+            exit 0
+          fi
+
+          REPO="${GITHUB_REPOSITORY}"
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          VERSION="${TAG#v}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+
+          # sha256 digest of a named release asset (strip the "sha256:" prefix).
+          digest() {
+            gh api "repos/${REPO}/releases/tags/${TAG}" \
+              --jq ".assets[] | select(.name==\"$1\") | .digest" | sed 's/^sha256://'
+          }
+          DARWIN_ARM="$(digest dex-darwin-arm64)"
+          DARWIN_X64="$(digest dex-darwin-x64)"
+          LINUX_ARM="$(digest dex-linux-arm64)"
+          LINUX_X64="$(digest dex-linux-x64)"
+
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/${OWNER}/homebrew-dex.git" tap
+
+          cat > tap/Formula/dex.rb <<EOF
+          class Dex < Formula
+            desc "Task tracking tool with MCP server and CLI interfaces"
+            homepage "https://github.com/${UPSTREAM}"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${BASE}/dex-darwin-arm64"
+                sha256 "${DARWIN_ARM}"
+              end
+              on_intel do
+                url "${BASE}/dex-darwin-x64"
+                sha256 "${DARWIN_X64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${BASE}/dex-linux-arm64"
+                sha256 "${LINUX_ARM}"
+              end
+              on_intel do
+                url "${BASE}/dex-linux-x64"
+                sha256 "${LINUX_X64}"
+              end
+            end
+
+            def install
+              bin.install Dir["dex-*"].first => "dex"
+            end
+
+            test do
+              assert_match "dex v#{version}", shell_output("#{bin}/dex --version")
+            end
+          end
+          EOF
+
+          cd tap
+          if git diff --quiet; then
+            echo "Formula already up to date for ${TAG}."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/dex.rb
+          git commit -m "dex ${VERSION}"
+          git push
